@@ -1,6 +1,6 @@
 # scrape2json
 
-Extract structured data from PDFs and web pages using AI.
+Extract structured data from PDFs and web pages using Azure OpenAI.
 
 ## Installation
 
@@ -10,16 +10,19 @@ pnpm install
 
 ## Configuration
 
-Copy `.env.example` to `.env` and add your ScrapeGraph API key:
+Copy `.env.example` to `.env` and configure your Azure OpenAI settings:
 
 ```bash
 cp .env.example .env
 ```
 
-Then edit `.env`:
+Required environment variables:
 
 ```
-SCRAPEGRAPH_API_KEY=your-api-key-here
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
+AZURE_OPENAI_API_KEY=your-api-key
+AZURE_OPENAI_DEPLOYMENT=your-deployment-name
+AZURE_OPENAI_API_VERSION=2024-02-15-preview  # optional
 ```
 
 ## Usage

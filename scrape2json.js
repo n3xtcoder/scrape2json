@@ -1,12 +1,18 @@
 import 'dotenv/config';
-import { smartScraper } from 'scrapegraph-js';
 import pdf2md from '@opendocsg/pdf2md';
 import TurndownService from 'turndown';
 
-const apiKey = process.env.SCRAPEGRAPH_API_KEY;
-if (!apiKey) {
-  console.error('Error: SCRAPEGRAPH_API_KEY environment variable is required');
-  console.error('Copy .env.example to .env and add your API key');
+// Azure OpenAI configuration
+const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
+const apiKey = process.env.AZURE_OPENAI_API_KEY;
+const deployment = process.env.AZURE_OPENAI_DEPLOYMENT;
+const apiVersion = process.env.AZURE_OPENAI_API_VERSION || '2024-02-15-preview';
+
+if (!endpoint || !apiKey || !deployment) {
+  console.error('Error: Azure OpenAI environment variables are required');
+  console.error('Required: AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT');
+  console.error('Optional: AZURE_OPENAI_API_VERSION (default: 2024-02-15-preview)');
+  console.error('Copy .env.example to .env and configure your Azure OpenAI settings');
   process.exit(1);
 }
 
@@ -18,28 +24,67 @@ if (inputUrls.length === 0) {
   process.exit(1);
 }
 
-const itemPrompt = `Extract the following fields:
+const itemSystemPrompt = `You are a document analyzer. Extract structured data from the provided document and return valid JSON only.`;
 
-- title
-- date (relevant to the implementation)
+const itemUserPrompt = `Extract the following fields from this document:
 
-Generate a summary of no more than 1 paragraph.
+- title: The document title
+- date: The date relevant to the implementation (in ISO format YYYY-MM-DD if possible)
+- summary: A concise summary of no more than 1 paragraph
 
-Return JSON with following fields:
+Return ONLY valid JSON with these fields: date, title, summary
 
-- date
-- title
-- summary`;
+Document content:
+`;
 
-const metaPrompt = `Given these document summaries, generate:
+const metaSystemPrompt = `You are a document collection analyzer. Synthesize information from multiple document summaries and return valid JSON only.`;
+
+const metaUserPrompt = `Given these document summaries, generate:
 
 1. A concise title that describes the overall collection
 2. A meta-summary (1 paragraph) synthesizing the key themes across all documents
 
-Return JSON with following fields:
+Return ONLY valid JSON with these fields: title, summary
 
-- title
-- summary`;
+Document summaries:
+`;
+
+/**
+ * Call Azure OpenAI chat completion API
+ */
+async function callAzureOpenAI(systemPrompt, userContent) {
+  const url = `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`;
+  
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'api-key': apiKey,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userContent }
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.3
+    })
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Azure OpenAI API error: ${response.status} - ${error}`);
+  }
+
+  const data = await response.json();
+  const content = data.choices?.[0]?.message?.content;
+  
+  if (!content) {
+    throw new Error('No content in Azure OpenAI response');
+  }
+
+  return JSON.parse(content);
+}
 
 /**
  * Detect if a URL points to a PDF based on URL extension or content-type
@@ -98,24 +143,16 @@ async function urlToMarkdown(url) {
 }
 
 /**
- * Extract data from markdown using smartScraper
+ * Extract data from markdown using Azure OpenAI
  */
-async function extractWithSmartScraper(markdown, prompt) {
-  return await smartScraper(
-    apiKey,
-    null,           // url (null since we're using websiteMarkdown)
-    prompt,
-    null,           // schema
-    null,           // numberOfScrolls
-    null,           // totalPages
-    null,           // cookies
-    {},             // options
-    false,          // plain_text
-    false,          // renderHeavyJs
-    false,          // stealth
-    null,           // websiteHtml
-    markdown        // websiteMarkdown
-  );
+async function extractFromMarkdown(markdown, systemPrompt, userPromptPrefix) {
+  // Truncate markdown if too long (leave room for prompts)
+  const maxLength = 100000;
+  const truncatedMarkdown = markdown.length > maxLength 
+    ? markdown.substring(0, maxLength) + '\n\n[Content truncated...]'
+    : markdown;
+  
+  return await callAzureOpenAI(systemPrompt, userPromptPrefix + truncatedMarkdown);
 }
 
 /**
@@ -126,7 +163,7 @@ async function scrapeUrlToJson(url) {
   console.log(`  Converted to ${markdown.length} characters of Markdown`);
   
   console.log('  Extracting data...');
-  const result = await extractWithSmartScraper(markdown, itemPrompt);
+  const result = await extractFromMarkdown(markdown, itemSystemPrompt, itemUserPrompt);
   
   return { ...result, url };
 }
@@ -141,27 +178,17 @@ function parseDate(dateStr) {
 }
 
 /**
- * Extract the actual result data from API response
- */
-function unwrapResult(apiResponse) {
-  // smartScraper returns { result: { ... }, request_id: ... }
-  return apiResponse?.result || apiResponse;
-}
-
-/**
  * Generate meta summary from all items
  */
 async function generateMetaSummary(items) {
   const summariesMarkdown = items
-    .map((item, i) => {
-      const data = unwrapResult(item);
-      return `## Document ${i + 1}: ${data.title || 'Untitled'}\n\nDate: ${data.date || 'Unknown'}\n\n${data.summary || 'No summary'}`;
-    })
+    .map((item, i) => `## Document ${i + 1}: ${item.title || 'Untitled'}\n\nDate: ${item.date || 'Unknown'}\n\n${item.summary || 'No summary'}`)
     .join('\n\n---\n\n');
   
   console.log('\nGenerating meta summary...');
   console.log('Summaries being sent:\n' + summariesMarkdown.substring(0, 500) + '...\n');
-  return await extractWithSmartScraper(summariesMarkdown, metaPrompt);
+  
+  return await extractFromMarkdown(summariesMarkdown, metaSystemPrompt, metaUserPrompt);
 }
 
 /**
@@ -187,11 +214,9 @@ async function scrapeMultipleUrls(urls) {
     }
   }
   
-  // Sort items by date (unwrap result to access date field)
+  // Sort items by date
   const sortedItems = items.sort((a, b) => {
-    const dateA = unwrapResult(a).date;
-    const dateB = unwrapResult(b).date;
-    return parseDate(dateA).getTime() - parseDate(dateB).getTime();
+    return parseDate(a.date).getTime() - parseDate(b.date).getTime();
   });
   
   // Generate meta summary
@@ -200,23 +225,10 @@ async function scrapeMultipleUrls(urls) {
     ? await generateMetaSummary(validItems)
     : { title: 'No valid documents', summary: 'All documents failed to process.' };
   
-  // Normalize items to flatten the result structure
-  const normalizedItems = sortedItems.map(item => {
-    if (item.error) return item;
-    const data = unwrapResult(item);
-    return {
-      url: item.url,
-      title: data.title,
-      date: data.date,
-      summary: data.summary
-    };
-  });
-
-  const metaData = unwrapResult(meta);
   return {
-    title: metaData.title,
-    summary: metaData.summary,
-    items: normalizedItems
+    title: meta.title,
+    summary: meta.summary,
+    items: sortedItems
   };
 }
 
