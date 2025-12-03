@@ -7,13 +7,26 @@ const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
 const apiKey = process.env.AZURE_OPENAI_API_KEY;
 const deployment = process.env.AZURE_OPENAI_DEPLOYMENT;
 const apiVersion = process.env.AZURE_OPENAI_API_VERSION || '2024-02-15-preview';
+const temperature = parseFloat(process.env.AZURE_OPENAI_TEMPERATURE) || 0.2;
+const throttleMs = parseInt(process.env.AZURE_OPENAI_THROTTLE_MS) || 5000; // 5 seconds default
+const maxMarkdownLength = parseInt(process.env.MAX_MARKDOWN_LENGTH) || 50000; // ~50k chars default
 
 if (!endpoint || !apiKey || !deployment) {
   console.error('Error: Azure OpenAI environment variables are required');
   console.error('Required: AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT');
   console.error('Optional: AZURE_OPENAI_API_VERSION (default: 2024-02-15-preview)');
+  console.error('Optional: AZURE_OPENAI_TEMPERATURE (default: 0.2)');
+  console.error('Optional: AZURE_OPENAI_THROTTLE_MS (default: 5000)');
+  console.error('Optional: MAX_MARKDOWN_LENGTH (default: 50000)');
   console.error('Copy .env.example to .env and configure your Azure OpenAI settings');
   process.exit(1);
+}
+
+/**
+ * Sleep for specified milliseconds
+ */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // Get URLs from command line arguments
@@ -24,29 +37,29 @@ if (inputUrls.length === 0) {
   process.exit(1);
 }
 
-const itemSystemPrompt = `You are a document analyzer. Extract structured data from the provided document and return valid JSON only.`;
+const itemSystemPrompt = `You extract structured data from documents. Be extremely concise. Return valid JSON only.`;
 
-const itemUserPrompt = `Extract the following fields from this document:
+const itemUserPrompt = `Extract from this document:
 
-- title: The document title
-- date: The date relevant to the implementation (in ISO format YYYY-MM-DD if possible)
-- summary: A concise summary of no more than 1 paragraph
+- title: Document title
+- date: Implementation date (YYYY-MM-DD)
+- summary: 2-3 sentences maximum, key points only
 
-Return ONLY valid JSON with these fields: date, title, summary
+Return JSON with: date, title, summary
 
-Document content:
+Document:
 `;
 
-const metaSystemPrompt = `You are a document collection analyzer. Synthesize information from multiple document summaries and return valid JSON only.`;
+const metaSystemPrompt = `You synthesize document collections. Be extremely concise. Return valid JSON only.`;
 
-const metaUserPrompt = `Given these document summaries, generate:
+const metaUserPrompt = `From these summaries, generate:
 
-1. A concise title that describes the overall collection
-2. A meta-summary (1 paragraph) synthesizing the key themes across all documents
+- title: Brief collection title
+- summary: 2-3 sentences synthesizing key themes
 
-Return ONLY valid JSON with these fields: title, summary
+Return JSON with: title, summary
 
-Document summaries:
+Summaries:
 `;
 
 /**
@@ -67,7 +80,7 @@ async function callAzureOpenAI(systemPrompt, userContent) {
         { role: 'user', content: userContent }
       ],
       response_format: { type: 'json_object' },
-      temperature: 0.3
+      temperature
     })
   });
 
@@ -81,6 +94,12 @@ async function callAzureOpenAI(systemPrompt, userContent) {
   
   if (!content) {
     throw new Error('No content in Azure OpenAI response');
+  }
+
+  // Throttle to avoid rate limits
+  if (throttleMs > 0) {
+    console.log(`  Throttling ${throttleMs}ms...`);
+    await sleep(throttleMs);
   }
 
   return JSON.parse(content);
@@ -147,10 +166,13 @@ async function urlToMarkdown(url) {
  */
 async function extractFromMarkdown(markdown, systemPrompt, userPromptPrefix) {
   // Truncate markdown if too long (leave room for prompts)
-  const maxLength = 100000;
-  const truncatedMarkdown = markdown.length > maxLength 
-    ? markdown.substring(0, maxLength) + '\n\n[Content truncated...]'
+  const truncatedMarkdown = markdown.length > maxMarkdownLength 
+    ? markdown.substring(0, maxMarkdownLength) + '\n\n[Content truncated...]'
     : markdown;
+  
+  if (markdown.length > maxMarkdownLength) {
+    console.log(`  Truncated from ${markdown.length} to ${maxMarkdownLength} chars`);
+  }
   
   return await callAzureOpenAI(systemPrompt, userPromptPrefix + truncatedMarkdown);
 }
